@@ -47,6 +47,7 @@ After:
 #include <cstddef>
 #include <unordered_map>
 #include <list>
+#include <future>
 
 #ifdef _WIN64
 #define CALCON __cdecl
@@ -59,7 +60,7 @@ After:
 /* Utils, constants declarations */
 
 bool IsWindowsExplorerWindow(void);
-class HWNDCache;
+template <class T = bool> class HWNDCache;
 const size_t kMaxCacheEntries = 128;
 struct {
     bool fileExplorerDetection;
@@ -112,13 +113,12 @@ BOOL Wh_ModInit(void)
 }
 
 /* Utils */
-
-class HWNDCache 
+template <class T> class HWNDCache
 {
 public:
     HWNDCache(size_t maxSize) : m_maxSize(maxSize) {}
 
-    bool TryGet(HWND hwnd, bool& result)
+    T TryGet(HWND hwnd, T& result)
     {
         auto it = m_cacheMap.find(hwnd);
         if (it == m_cacheMap.end()) return false;
@@ -128,7 +128,7 @@ public:
         return true;
     }
 
-    void Insert(HWND hwnd, bool value)
+    void Insert(HWND hwnd, T value)
     {
         auto it = m_cacheMap.find(hwnd);
         if (it != m_cacheMap.end()) 
@@ -149,15 +149,24 @@ public:
         }
     }
 
+    std::future<void> InsertAsync(HWND hwnd, T value)
+    {
+        return std::async(std::launch::async, [this, hwnd, value]() {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            this->Insert(hwnd, value);
+        });
+    }
+
     size_t GetCacheSize()
     {
         return m_cacheList.size();
     }
 
-private:
+protected:
     size_t m_maxSize;
     std::list<HWND> m_cacheList;
-    std::unordered_map<HWND, std::pair<bool, std::list<HWND>::iterator>> m_cacheMap;
+    std::unordered_map<HWND, std::pair<T, std::list<HWND>::iterator>> m_cacheMap;
+    std::mutex m_mutex;
 };
 
 HWNDCache g_hwndCache(kMaxCacheEntries);
@@ -184,6 +193,7 @@ bool IsWindowsExplorerWindow() {
     }
 
     bool isExplorer = wcsstr(className, L"CabinetWClass") != nullptr;
-    g_hwndCache.Insert(currentWindow, isExplorer);
+    g_hwndCache.InsertAsync(currentWindow, isExplorer);
+
     return isExplorer;
 }
