@@ -2,7 +2,7 @@
 // @id              classic-explorer-dragdrop
 // @name            Classic Explorer Drag/Drop
 // @description     Enables/fixes the classic drag/drop image in File Explorer.
-// @version         1.0
+// @version         1.0.1
 // @author          Isabella Lulamoon (kawapure)
 // @github          https://github.com/kawapure
 // @twitter         https://twitter.com/kawaipure
@@ -11,18 +11,7 @@
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
-/*
-# Classic Explorer Drag/Drop
-
-Forces the classic drag/drop image resembling the list view item itself to be used in File Explorer,
-and fixes a bug introduced in Windows 7 whereby the drag/drop image will not be displayed in classic
-theme.
-
-## Caveats
-
-This does not work with the DirectUI list view used since Windows 7. In such cases, the Windows Vista
-style will always be used.
-*/
+/*...*/
 // ==/WindhawkModReadme==
 
 #include <processenv.h>
@@ -179,11 +168,6 @@ BOOL Wh_ModInit()
 {
     Wh_Log(L"Init " WH_MOD_ID L" version " WH_MOD_VERSION);
 
-    HMODULE hmUxtheme = GetModuleHandleW(L"uxtheme.dll");
-    HMODULE hmShell32 = GetModuleHandleW(L"shell32.dll");
-
-    if (hmUxtheme && hmShell32)
-    {
         Wh_SetFunctionHook(
             (void *)OpenThemeData,
             (void *)OpenThemeData_hook,
@@ -195,27 +179,16 @@ BOOL Wh_ModInit()
             (void *)IsAppThemed_hook,
             (void **)&IsAppThemed_orig
         );
-        
-        if (!WindhawkUtils::HookSymbols(hmShell32, c_rgShell32Hooks, ARRAYSIZE(c_rgShell32Hooks)))
-        {
-            Wh_Log(L"Failed to install shell32.dll hooks.");
-            return FALSE;
-        }
-    }
-    else
-    {
-        if (!hmUxtheme)
-            Wh_Log(L"Failed to find handle to uxtheme.dll.");
-        if (!hmShell32)
-            Wh_Log(L"Failed to find handle to shell32.dll.");
-        return FALSE;
-    }
+		
+		Wh_SetFunctionHook(
+            (void*)GetProcAddress(LoadLibrary(L"shell32.dll"), "RegQueryValueExW"), 
+            (void*)GetDragImageMsg, 
+            (void**)&pfnGetDragImageMsg);
+
+		Wh_SetFunctionHook(
+            (void*)GetProcAddress(LoadLibrary(L"shell32.dll"), "s_ListViewSubclassWndProc"), 
+            (void*)CListViewHost__s_ListViewSubclassWndProc_hook, 
+            (void**)&CListViewHost__s_ListViewSubclassWndProc_orig);
 
     return TRUE;
-}
-
-// The mod is being unloaded, free all allocated resources.
-void Wh_ModUninit()
-{
-
 }
