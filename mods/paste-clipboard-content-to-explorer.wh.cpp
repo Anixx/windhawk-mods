@@ -1,6 +1,6 @@
 // ==WindhawkMod==
-// @id              paste-clipboard-content-to-explorer-fork
-// @name            Paste Clipboard Content to Explorer - Fork
+// @id              paste-clipboard-content-to-explorer
+// @name            Paste Clipboard Content to Explorer
 // @description     Paste text and images from clipboard as files in Explorer and in file dialogs
 // @version         1.7
 // @author          Anixx
