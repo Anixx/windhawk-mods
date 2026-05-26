@@ -2,7 +2,7 @@
 // @id              paste-clipboard-content-to-explorer
 // @name            Paste Clipboard Content to Explorer
 // @description     Paste text and images from clipboard as files in Explorer and in file dialogs
-// @version         1.6
+// @version         1.7
 // @author          Anixx
 // @github          https://github.com/Anixx
 // @include         *
@@ -19,6 +19,7 @@ on the desktop and in open/save file dialogs.
 ## Features
 - Paste text as .txt (UTF-8, UTF-8 with BOM, or UTF-16 LE with BOM)
 - Paste images as .png
+- Trigger git clone when clipboard contains a GitHub .git URL
 - Auto-naming with incrementing number on conflict
 - Works in Explorer folders, on the desktop, in file dialogs
 - Works with network folders (UNC paths)
@@ -43,6 +44,9 @@ on the desktop and in open/save file dialogs.
 - enableImagePaste: true
   $name: Enable image paste
   $description: Allow pasting images from clipboard
+- enableAutoClone: true
+  $name: Enable auto git clone
+  $description: Automatically run `git clone` when clipboard contains a GitHub .git URL
 */
 // ==/WindhawkModSettings==
 
@@ -68,6 +72,7 @@ struct {
     std::wstring textEncoding = L"UTF-16";
     bool enableTextPaste = true;
     bool enableImagePaste = true;
+    bool enableAutoClone = true;
 } g_settings;
 
 // ============================================================
@@ -81,6 +86,7 @@ void LoadSettings()
     
     g_settings.enableTextPaste = Wh_GetIntSetting(L"enableTextPaste");
     g_settings.enableImagePaste = Wh_GetIntSetting(L"enableImagePaste");
+    g_settings.enableAutoClone = Wh_GetIntSetting(L"enableAutoClone");
 }
 
 // ============================================================
@@ -632,8 +638,98 @@ static bool PerformPaste(HWND sourceWindow)
         { filePath=GetUniquePath(targetPath,baseName,L".png");
           errCode=SaveImageFromClipboard(filePath,targetPath); }
     else if (hasText)
-        { filePath=GetUniquePath(targetPath,baseName,L".txt");
-          errCode=SaveTextFromClipboard(filePath); }
+        {
+            // If clipboard text is a GitHub clone URL, try to run `git clone` into targetPath.
+            bool triedClone = false;
+            if (IsClipboardFormatAvailable(CF_UNICODETEXT))
+            {
+                if (OpenClipboard(nullptr))
+                {
+                    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+                    if (h)
+                    {
+                        WCHAR* text = (WCHAR*)GlobalLock(h);
+                        if (text)
+                        {
+                            std::wstring s = text;
+                            // trim whitespace
+                            while (!s.empty() && iswspace(s.front())) s.erase(s.begin());
+                            while (!s.empty() && iswspace(s.back())) s.pop_back();
+                            const std::wstring prefix = L"https://github.com/";
+                            const std::wstring suffix = L".git";
+                            if (g_settings.enableAutoClone &&
+                                s.size() > prefix.size() + suffix.size() &&
+                                _wcsnicmp(s.c_str(), prefix.c_str(), prefix.size()) == 0 &&
+                                _wcsicmp(s.substr(s.size()-suffix.size()).c_str(), suffix.c_str()) == 0)
+                            {
+                                triedClone = true;
+                                // extract owner and repo for messages
+                                std::wstring inner = s.substr(prefix.size(), s.size() - prefix.size() - suffix.size()); // owner/repo
+                                std::wstring owner, repo;
+                                size_t slash = inner.find(L'/');
+                                if (slash != std::wstring::npos) {
+                                    owner = inner.substr(0, slash);
+                                    repo = inner.substr(slash+1);
+                                } else {
+                                    owner = L""; repo = inner;
+                                }
+                                // Build command: cmd.exe /C git clone "<url>"
+                                std::wstring cmd = L"cmd.exe /C git clone \"" + s + L"\"";
+                                STARTUPINFOW si = {};
+                                PROCESS_INFORMATION pi = {};
+                                si.cb = sizeof(si);
+                                // Run in targetPath working directory
+                                BOOL ok = CreateProcessW(nullptr, (LPWSTR)cmd.c_str(), nullptr, nullptr, FALSE,
+                                                         CREATE_NO_WINDOW, nullptr,
+                                                         targetPath.c_str(), &si, &pi);
+                                if (ok)
+                                {
+                                    WaitForSingleObject(pi.hProcess, INFINITE);
+                                    DWORD exitCode = 1;
+                                    GetExitCodeProcess(pi.hProcess, &exitCode);
+                                    CloseHandle(pi.hProcess);
+                                    CloseHandle(pi.hThread);
+                                    if (exitCode == 0)
+                                    {
+                                        errCode = 0;
+                                        std::wstring msg = L"Git clone completed successfully:\n";
+                                        if (!owner.empty()) msg += repo + L" by " + owner;
+                                        else msg += repo;
+                                        MessageBoxW(nullptr, msg.c_str(), L"PasteClipboardToExplorer", MB_OK | MB_ICONINFORMATION);
+                                    }
+                                    else
+                                    {
+                                        errCode = ERROR_GEN_FAILURE;
+                                        std::wstring msg = L"Git clone failed (exit code " + std::to_wstring(exitCode) + L").\nFalling back to saving clipboard as text:\n";
+                                        if (!owner.empty()) msg += repo + L" by " + owner;
+                                        else msg += repo;
+                                        MessageBoxW(nullptr, msg.c_str(), L"PasteClipboardToExplorer", MB_OK | MB_ICONERROR);
+                                    }
+                                }
+                                else
+                                {
+                                    // CreateProcess failed -> likely git not found or other error
+                                    errCode = GetLastError();
+                                    std::wstring msg = L"Failed to start git (error " + std::to_wstring(errCode) + L").\nFalling back to saving clipboard as text:\n";
+                                    if (!owner.empty()) msg += repo + L" by " + owner;
+                                    else msg += repo;
+                                    MessageBoxW(nullptr, msg.c_str(), L"PasteClipboardToExplorer", MB_OK | MB_ICONERROR);
+                                }
+                            }
+                            GlobalUnlock(h);
+                        }
+                    }
+                    CloseClipboard();
+                }
+            }
+
+            // Fallback: if we didn't successfully clone (or didn't attempt), save text as file
+            if (errCode != 0)
+            {
+                filePath = GetUniquePath(targetPath, baseName, L".txt");
+                errCode = SaveTextFromClipboard(filePath);
+            }
+        }
     if (errCode == 0)
     {
         Wh_Log(L"PerformPaste: created '%s'", filePath.c_str());
