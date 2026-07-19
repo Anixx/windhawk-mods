@@ -1,24 +1,13 @@
 // ==WindhawkMod==
-// @id              flexible-explorer-toolbars-deluxe
-// @name            Flexible Explorer Toolbars Deluxe
+// @id              flexible-explorer-toolbars-deluxe-fork
+// @name            Flexible Explorer Toolbars Deluxe - Fork
 // @description     Makes Search Bar, Breadcrumb Bar and others into movable toolbars
-// @version         1.1
+// @version         1.3
 // @author          Anixx
 // @github          https://github.com/Anixx
 // @include         explorer.exe
 // @compilerOptions -lcomctl32
 // ==/WindhawkMod==
-
-// ==WindhawkModSettings==
-/*
-- MoveSearchBand: true
-  $name: Show Search Bar
-- MoveBreadcrumb: true
-  $name: Show Breadcrumb Bar
-- MoveUpButton: true
-  $name: Show Up Button
-*/
-// ==/WindhawkModSettings==
 
 // ==WindhawkModReadme==
 /*
@@ -45,6 +34,11 @@ This mod hides the Navigation Bar and instead creates the following optional too
 
 The toolbars can be locked and unlocked.
 If you are using this mod together with Classic Explorer toolbar (Open Shell), enable that toolbar before enabling this mod, otherwise its enabled state will not be remembered.
+
+**Toolbar visibility** is controlled from the right-click context menu of any of the movable toolbars (or of the Menu Bar itself) — the same menu where "Lock the Toolbars" is located.
+Three checkable items are added there ("Search Bar", "Address" and "Up") that let you show/hide the corresponding toolbar on the fly. The choice is stored via the Windhawk Storage API.
+
+By default, only the Search Bar is shown; the Address (breadcrumb) bar and the Up button are hidden until explicitly enabled from that context menu.
 
 # Further adjustments
 
@@ -75,10 +69,22 @@ If you are using this mod together with Classic Explorer toolbar (Open Shell), e
 #include <unordered_set>
 #include <vector>
 #include <string>
+#include <algorithm>
+#include <climits>
 #include <windowsx.h>
 
 constexpr int UP_BUTTON_ICON_SIZE  = 16;
 constexpr UINT LOCK_TOOLBARS_CMD_ID = 41484;
+
+constexpr UINT CMD_TOGGLE_SEARCHBAND = 0xF101;
+constexpr UINT CMD_TOGGLE_BREADCRUMB = 0xF102;
+constexpr UINT CMD_TOGGLE_UPBUTTON   = 0xF103;
+
+constexpr UINT STR_ID_SEARCHBAR   = 34304; // "Search Box"          (ExplorerFrame.dll)
+constexpr UINT STR_ID_BREADCRUMB  = 49952; // "Address"             (ExplorerFrame.dll)
+constexpr UINT STR_ID_UPBUTTON    = 9026;  // "Up one level"        (ExplorerFrame.dll)
+
+enum class BandType { Search, Breadcrumb, UpButton };
 
 UINT g_msgDoMove = 0;
 
@@ -89,11 +95,16 @@ struct Settings {
 } g_settings;
 
 void LoadSettings() {
-    g_settings.moveSearchBand = Wh_GetIntSetting(L"MoveSearchBand");
-    g_settings.moveBreadcrumb = Wh_GetIntSetting(L"MoveBreadcrumb");
-    g_settings.moveUpButton   = Wh_GetIntSetting(L"MoveUpButton");
+    // Defaults for a fresh install (no saved value yet):
+    // only the Search Bar is shown, Breadcrumb/Up are off.
+    g_settings.moveSearchBand = Wh_GetIntValue(L"MoveSearchBand", 1) != 0;
+    g_settings.moveBreadcrumb = Wh_GetIntValue(L"MoveBreadcrumb", 0) != 0;
+    g_settings.moveUpButton   = Wh_GetIntValue(L"MoveUpButton", 0) != 0;
 }
-void Wh_ModSettingsChanged() { LoadSettings(); }
+
+void SaveSettingValue(const wchar_t* name, bool value) {
+    Wh_SetIntValue(name, value ? 1 : 0);
+}
 
 CRITICAL_SECTION g_mutex;
 
@@ -105,7 +116,11 @@ std::unordered_map<HWND,HWND>    g_cabinetToMenuRebar;
 std::unordered_set<HWND>         g_pendingApply;
 std::unordered_map<HWND,int>     g_applyAttempts;
 
-enum ChildFlag { CF_MOVED=1, CF_UPBUTTON=2, CF_BREADCRUMB=4 };
+std::unordered_map<HWND,HWND>    g_removedSearchBand;
+std::unordered_map<HWND,HWND>    g_removedBreadcrumbBand;
+std::unordered_map<HWND,HWND>    g_removedUpButtonBand;
+
+enum ChildFlag { CF_MOVED=1, CF_UPBUTTON=2, CF_BREADCRUMB=4, CF_SEARCH=8 };
 std::unordered_map<HWND,int> g_childFlags;
 
 struct ToolbarGuard{int x=0,y=0,cx=0,cy=0;bool hasGood=false;};
@@ -116,6 +131,21 @@ std::unordered_map<HWND, WindhawkUtils::WH_SUBCLASSPROC> g_subclassedWindows;
 thread_local bool g_insideApply = false;
 thread_local int  g_rebarLayoutDepth = 0;
 thread_local bool g_insideGripperSync = false;
+thread_local bool g_insideUpButtonResize = false;
+
+// Set to true only around SendMessage(..., TB_AUTOSIZE, ...) calls
+// that WE deliberately issue on a moved Breadcrumb toolbar (e.g. to
+// correct its size right after inserting it into the menu rebar).
+// BreadcrumbToolbar_SubclassProc's WM_WINDOWPOSCHANGING guard treats
+// such calls the same as a resize coming from inside the rebar's own
+// layout pass: it lets it through and remembers it as the new "good"
+// geometry. Any OTHER, uncontrolled attempt by Explorer to reposition
+// this toolbar (e.g. its own address-band logic reacting to mouse
+// activity near it) is still blocked and reverted to that cached good
+// geometry - this is what prevents the toolbar from randomly jumping
+// to another rebar row.
+thread_local bool g_allowControlledReposition = false;
+
 bool IsInsideRebarLayout() { return g_rebarLayoutDepth > 0; }
 
 void HookWindow(HWND hwnd, WindhawkUtils::WH_SUBCLASSPROC subclassProc);
@@ -234,6 +264,12 @@ void CleanupCabinetState(HWND cab){
     }
     UnregisterCabinetMenuRebar(cab);
 
+    EnterCriticalSection(&g_mutex);
+    g_removedSearchBand.erase(cab);
+    g_removedBreadcrumbBand.erase(cab);
+    g_removedUpButtonBand.erase(cab);
+    LeaveCriticalSection(&g_mutex);
+
     // Explicitly clean up neutered leftovers (Breadcrumb Parent / UpBand).
     // These windows are never hooked, so WM_NCDESTROY won't self-clean them.
     EnterCriticalSection(&g_mutex);
@@ -261,21 +297,38 @@ void GetEffectiveClassName(HWND child, wchar_t* out, size_t outCount) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Per-class saved layout: order rank + size + break flag.
+// Keyed by (effective) class name so it survives a band being removed
+// from the rebar entirely (e.g. toolbar hidden via the context menu)
+// and can be restored later at exactly the same spot.
+// ---------------------------------------------------------------------
+
+int GetSavedOrderRank(const wchar_t* cls){
+    if(!cls||!cls[0])return INT_MAX;
+    WCHAR ok[160];swprintf_s(ok,ARRAYSIZE(ok),L"OrderRank_%s",cls);
+    return Wh_GetIntValue(ok, INT_MAX);
+}
+void SetSavedOrderRank(const wchar_t* cls,int rank){
+    if(!cls||!cls[0])return;
+    WCHAR ok[160];swprintf_s(ok,ARRAYSIZE(ok),L"OrderRank_%s",cls);
+    Wh_SetIntValue(ok, rank);
+}
+
 void SaveBandPositions(HWND rebar){
     if(!rebar||!IsWindow(rebar))return;
     int cnt=(int)SendMessage(rebar,RB_GETBANDCOUNT,0,0);
-    Wh_SetIntValue(L"BandCount", cnt);
     for(int i=0;i<cnt;i++){
         REBARBANDINFO rbi={sizeof(rbi)};rbi.fMask=RBBIM_SIZE|RBBIM_STYLE|RBBIM_CHILD;
         if(!SendMessage(rebar,RB_GETBANDINFO,i,(LPARAM)&rbi))continue;
         WCHAR cls[256]=L"";
         if(rbi.hwndChild&&IsWindow(rbi.hwndChild))
             GetEffectiveClassName(rbi.hwndChild,cls,ARRAYSIZE(cls));
-        WCHAR ok[64];swprintf_s(ok,ARRAYSIZE(ok),L"Order_%d",i);
-        Wh_SetStringValue(ok, cls);
-        WCHAR ck[128];swprintf_s(ck,ARRAYSIZE(ck),L"Cx_%s",cls);
+        if(!cls[0])continue;
+        SetSavedOrderRank(cls, i);
+        WCHAR ck[160];swprintf_s(ck,ARRAYSIZE(ck),L"Cx_%s",cls);
         Wh_SetIntValue(ck, (int)rbi.cx);
-        WCHAR bk[128];swprintf_s(bk,ARRAYSIZE(bk),L"Break_%s",cls);
+        WCHAR bk[160];swprintf_s(bk,ARRAYSIZE(bk),L"Break_%s",cls);
         Wh_SetIntValue(bk, (rbi.fStyle&RBBS_BREAK)?1:0);
     }
 }
@@ -283,8 +336,8 @@ void SaveBandPositions(HWND rebar){
 struct BandState{UINT cx;bool brk;};
 
 bool LoadBandState(const wchar_t* cls,BandState& out){
-    WCHAR ck[128];swprintf_s(ck,ARRAYSIZE(ck),L"Cx_%s",cls);
-    WCHAR bk[128];swprintf_s(bk,ARRAYSIZE(bk),L"Break_%s",cls);
+    WCHAR ck[160];swprintf_s(ck,ARRAYSIZE(ck),L"Cx_%s",cls);
+    WCHAR bk[160];swprintf_s(bk,ARRAYSIZE(bk),L"Break_%s",cls);
     int cx = Wh_GetIntValue(ck, -1);
     if(cx < 20 || cx > 8000) return false;
     int brk = Wh_GetIntValue(bk, 0);
@@ -293,23 +346,52 @@ bool LoadBandState(const wchar_t* cls,BandState& out){
     return true;
 }
 
-std::vector<std::wstring> LoadBandOrder(){
-    std::vector<std::wstring> order;
-    int cnt = Wh_GetIntValue(L"BandCount", 0);
-    for(int i=0; i<cnt; i++){
-        WCHAR ok[64];swprintf_s(ok,ARRAYSIZE(ok),L"Order_%d",i);
-        WCHAR val[256]=L"";
-        if(Wh_GetStringValue(ok, val, ARRAYSIZE(val)) > 0)
-            order.push_back(val);
-    }
-    return order;
-}
-
+// Actually applies the small icon size to the Up button toolbar.
+// TB_SETBITMAPSIZE alone has no documented effect on bitmaps already
+// added to the toolbar, so we also rely on the reactive re-invocation
+// points below (called on the messages that can make Explorer reset
+// this) to make sure the change actually sticks visually.
 void ResizeUpButtonToolbar(HWND toolbar) {
     if (!toolbar || !IsWindow(toolbar)) return;
+    if (g_insideUpButtonResize) return;
+    g_insideUpButtonResize = true;
+
     SendMessage(toolbar, TB_SETBITMAPSIZE, 0, MAKELONG(UP_BUTTON_ICON_SIZE, UP_BUTTON_ICON_SIZE));
     SendMessage(toolbar, TB_SETPADDING, 0, MAKELONG(4, 4));
     SendMessage(toolbar, TB_AUTOSIZE, 0, 0);
+
+    g_insideUpButtonResize = false;
+}
+
+// Applies TB_AUTOSIZE to a moved Breadcrumb toolbar while marking the
+// call as "controlled" (see g_allowControlledReposition above), so
+// the resulting resize actually takes visual effect immediately and
+// is remembered as the toolbar's new "good" geometry, instead of
+// being reverted by BreadcrumbToolbar_SubclassProc's protective
+// WM_WINDOWPOSCHANGING guard.
+void ApplyBreadcrumbAutosize(HWND toolbar) {
+    if (!toolbar || !IsWindow(toolbar)) return;
+    g_allowControlledReposition = true;
+    SendMessage(toolbar, TB_AUTOSIZE, 0, 0);
+    g_allowControlledReposition = false;
+}
+
+// Re-applies the visual size of the moved Up button / Breadcrumb
+// toolbars found inside the given rebar. Called synchronously as part
+// of the normal layout pipeline (relayout / saved-layout application),
+// not from a timer, so it stays in sync with real layout passes.
+void ReapplyBandVisualSizes(HWND menuRebar){
+    if(!menuRebar||!IsWindow(menuRebar))return;
+    int cnt=(int)SendMessage(menuRebar,RB_GETBANDCOUNT,0,0);
+    for(int i=0;i<cnt;i++){
+        REBARBANDINFO rbi={sizeof(rbi)};rbi.fMask=RBBIM_CHILD;
+        if(!SendMessage(menuRebar,RB_GETBANDINFO,i,(LPARAM)&rbi)||!rbi.hwndChild)continue;
+        if(HasChildFlag(rbi.hwndChild, CF_UPBUTTON)){
+            ResizeUpButtonToolbar(rbi.hwndChild);
+        } else if(HasChildFlag(rbi.hwndChild, CF_BREADCRUMB)){
+            ApplyBreadcrumbAutosize(rbi.hwndChild);
+        }
+    }
 }
 
 void ReapplyCx(HWND rebar){
@@ -322,6 +404,15 @@ void ReapplyCx(HWND rebar){
         if(!SendMessage(rebar,RB_GETBANDINFO,i,(LPARAM)&rbi))continue;
         WCHAR cls[256]=L"";
         if(rbi.hwndChild)GetEffectiveClassName(rbi.hwndChild,cls,ARRAYSIZE(cls));
+
+        if(rbi.hwndChild){
+            if(HasChildFlag(rbi.hwndChild, CF_UPBUTTON)){
+                ResizeUpButtonToolbar(rbi.hwndChild);
+            } else if(HasChildFlag(rbi.hwndChild, CF_BREADCRUMB)){
+                ApplyBreadcrumbAutosize(rbi.hwndChild);
+            }
+        }
+
         BandState bs;
         if(!LoadBandState(cls,bs))continue;
         bool cxOk=rbi.cx==bs.cx;
@@ -346,27 +437,53 @@ void ApplySavedLayout(HWND rebar){
     int cnt=(int)SendMessage(rebar,RB_GETBANDCOUNT,0,0);
     if(cnt<=0)return;
     g_insideApply=true;
-    std::vector<std::wstring> wantedOrder=LoadBandOrder();
-    for(int target=0;target<(int)wantedOrder.size();target++){
-        const std::wstring& wantCls=wantedOrder[target];
+
+    struct BandInfo{ int rank; HWND child; };
+    std::vector<BandInfo> infos;
+    infos.reserve(cnt);
+    for(int i=0;i<cnt;i++){
+        REBARBANDINFO rbi={sizeof(rbi)};rbi.fMask=RBBIM_CHILD;
+        if(!SendMessage(rebar,RB_GETBANDINFO,i,(LPARAM)&rbi))continue;
+        WCHAR cls[256]=L"";
+        if(rbi.hwndChild)GetEffectiveClassName(rbi.hwndChild,cls,ARRAYSIZE(cls));
+        int rank=GetSavedOrderRank(cls);
+        if(rank==INT_MAX)rank=i; // no saved rank yet -> keep current relative order
+        infos.push_back({rank, rbi.hwndChild});
+    }
+
+    // stable_sort keeps relative order for equal ranks (e.g. bands
+    // that never had a saved rank yet).
+    std::stable_sort(infos.begin(), infos.end(),
+        [](const BandInfo&a,const BandInfo&b){return a.rank<b.rank;});
+
+    for(int target=0;target<(int)infos.size();target++){
+        HWND wantChild=infos[target].child;
         int curCnt=(int)SendMessage(rebar,RB_GETBANDCOUNT,0,0);
         for(int j=target;j<curCnt;j++){
             REBARBANDINFO rbi={sizeof(rbi)};rbi.fMask=RBBIM_CHILD;
             if(!SendMessage(rebar,RB_GETBANDINFO,j,(LPARAM)&rbi))continue;
-            WCHAR cls[256]=L"";
-            if(rbi.hwndChild)GetEffectiveClassName(rbi.hwndChild,cls,ARRAYSIZE(cls));
-            if(wantCls==cls){
+            if(rbi.hwndChild==wantChild){
                 if(j!=target)SendMessage(rebar,RB_MOVEBAND,j,target);
                 break;
             }
         }
     }
+
     cnt=(int)SendMessage(rebar,RB_GETBANDCOUNT,0,0);
     for(int i=0;i<cnt;i++){
         REBARBANDINFO rbi={sizeof(rbi)};rbi.fMask=RBBIM_CHILD|RBBIM_STYLE;
         if(!SendMessage(rebar,RB_GETBANDINFO,i,(LPARAM)&rbi))continue;
         WCHAR cls[256]=L"";
         if(rbi.hwndChild)GetEffectiveClassName(rbi.hwndChild,cls,ARRAYSIZE(cls));
+
+        if(rbi.hwndChild){
+            if(HasChildFlag(rbi.hwndChild, CF_UPBUTTON)){
+                ResizeUpButtonToolbar(rbi.hwndChild);
+            } else if(HasChildFlag(rbi.hwndChild, CF_BREADCRUMB)){
+                ApplyBreadcrumbAutosize(rbi.hwndChild);
+            }
+        }
+
         BandState bs;
         if(!LoadBandState(cls,bs))continue;
         REBARBANDINFO set={sizeof(set)};
@@ -382,6 +499,8 @@ void ApplySavedLayout(HWND rebar){
     g_applyAttempts[rebar]=0;
     LeaveCriticalSection(&g_mutex);
     MarkPendingApply(rebar);
+
+    ReapplyBandVisualSizes(rebar);
 }
 
 HWND FindMenuBarRebar(HWND c){
@@ -472,6 +591,26 @@ void SuppressStrayNavWorkers(HWND cab){
         if(FindWindowEx(w,NULL,L"ReBarWindow32",NULL)){
             ForceHideNavWorker(w);
         }
+    }
+}
+
+// Forces the same layout pass that normally happens on a real resize
+// or when the window is reopened, so that bands we just inserted /
+// removed get their final geometry immediately instead of only after
+// the user manually resizes the window.
+void ForceCabinetRelayout(HWND cab) {
+    if (!cab || !IsWindow(cab)) return;
+    ExpandShellTabToFillCabinet(cab);
+    SuppressStrayNavWorkers(cab);
+    RECT rc;
+    GetClientRect(cab, &rc);
+    SendMessage(cab, WM_SIZE, SIZE_RESTORED, MAKELPARAM(rc.right, rc.bottom));
+    RedrawWindow(cab, NULL, NULL,
+        RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_ERASENOW | RDW_FRAME);
+
+    HWND mr = GetCabinetMenuRebar(cab);
+    if (mr && IsWindow(mr)) {
+        ReapplyBandVisualSizes(mr);
     }
 }
 
@@ -585,8 +724,31 @@ LRESULT CALLBACK UpButton_SubclassProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP
             return 0;
         }
     }
-    if (msg == WM_SIZE) ResizeUpButtonToolbar(hwnd);
-    return DefSubclassProc(hwnd, msg, wP, lP);
+
+    LRESULT r = DefSubclassProc(hwnd, msg, wP, lP);
+
+    // Re-apply our desired icon size *after* letting the default
+    // handling run for messages that can reset it (Explorer
+    // re-adding images/buttons, theme changes, resizes, etc). This is
+    // event-driven (not a timer), so it fires exactly when needed.
+    switch (msg) {
+        case WM_SIZE:
+        case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE:
+        case WM_SETTINGCHANGE:
+        case WM_DPICHANGED:
+        case TB_SETIMAGELIST:
+        case TB_SETHOTIMAGELIST:
+        case TB_ADDBUTTONSW:
+        case TB_ADDBUTTONSA:
+        case TB_INSERTBUTTONW:
+        case TB_INSERTBUTTONA:
+        case TB_LOADIMAGES:
+        case TB_BUTTONSTRUCTSIZE:
+            ResizeUpButtonToolbar(hwnd);
+            break;
+    }
+    return r;
 }
 
 LRESULT CALLBACK BreadcrumbToolbar_SubclassProc(HWND hwnd,UINT msg,WPARAM wP,LPARAM lP,DWORD_PTR){
@@ -606,7 +768,7 @@ LRESULT CALLBACK BreadcrumbToolbar_SubclassProc(HWND hwnd,UINT msg,WPARAM wP,LPA
         auto*pos=(WINDOWPOS*)lP;
         EnterCriticalSection(&g_mutex);
         ToolbarGuard&g=g_toolbarGuards[hwnd];
-        if(IsInsideRebarLayout()){
+        if(IsInsideRebarLayout() || g_allowControlledReposition){
             if(!(pos->flags&SWP_NOMOVE)){g.x=pos->x;g.y=pos->y;}
             if(!(pos->flags&SWP_NOSIZE)){g.cx=pos->cx;g.cy=pos->cy;}
             g.hasGood=true;pos->flags&=~SWP_HIDEWINDOW;
@@ -617,8 +779,323 @@ LRESULT CALLBACK BreadcrumbToolbar_SubclassProc(HWND hwnd,UINT msg,WPARAM wP,LPA
         LeaveCriticalSection(&g_mutex);
     }
     if(msg==WM_SHOWWINDOW&&!wP&&!IsInsideRebarLayout())return 0;
-    return DefSubclassProc(hwnd,msg,wP,lP);
+
+    LRESULT r = DefSubclassProc(hwnd,msg,wP,lP);
+
+    switch (msg) {
+        case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE:
+        case WM_SETTINGCHANGE:
+        case WM_DPICHANGED:
+        case TB_SETIMAGELIST:
+        case TB_SETHOTIMAGELIST:
+        case TB_ADDBUTTONSW:
+        case TB_ADDBUTTONSA:
+        case TB_INSERTBUTTONW:
+        case TB_INSERTBUTTONA:
+        case TB_LOADIMAGES:
+            ApplyBreadcrumbAutosize(hwnd);
+            break;
+    }
+    return r;
 }
+
+// ---------------------------------------------------------------------
+// Toolbar visibility context-menu integration
+// ---------------------------------------------------------------------
+
+bool MenuContainsId(HMENU hMenu, UINT id, int depth = 0) {
+    if (!hMenu) return false;
+    int cnt = GetMenuItemCount(hMenu);
+    for (int i = 0; i < cnt; i++) {
+        UINT curId = GetMenuItemID(hMenu, i);
+        if (curId == id) return true;
+        if (curId == (UINT)-1 && depth < 2) {
+            HMENU sub = GetSubMenu(hMenu, i);
+            if (sub && MenuContainsId(sub, id, depth + 1)) return true;
+        }
+    }
+    return false;
+}
+
+bool MenuHasItem(HMENU hMenu, UINT id) {
+    MENUITEMINFOW mii = {sizeof(mii)};
+    mii.fMask = MIIM_STATE;
+    return GetMenuItemInfoW(hMenu, id, FALSE, &mii) != 0;
+}
+
+void SetMenuItemChecked(HMENU hMenu, UINT id, bool checked) {
+    MENUITEMINFOW mii = {sizeof(mii)};
+    mii.fMask = MIIM_STATE;
+    mii.fState = checked ? MFS_CHECKED : MFS_UNCHECKED;
+    SetMenuItemInfoW(hMenu, id, FALSE, &mii);
+}
+
+std::wstring LoadEFString(UINT id, const wchar_t* fallback) {
+    HMODULE hMod = GetModuleHandleW(L"explorerframe.dll");
+    if (hMod) {
+        WCHAR buf[256];
+        int len = LoadStringW(hMod, id, buf, ARRAYSIZE(buf));
+        if (len > 0) return std::wstring(buf, len);
+    }
+    return fallback;
+}
+
+void AddOrUpdateToolbarMenuItems(HMENU hMenu) {
+    if (!MenuHasItem(hMenu, CMD_TOGGLE_SEARCHBAND)) {
+        std::wstring sSearch = LoadEFString(STR_ID_SEARCHBAR, L"Search Bar");
+        std::wstring sBread  = LoadEFString(STR_ID_BREADCRUMB, L"Address");
+        std::wstring sUp     = LoadEFString(STR_ID_UPBUTTON, L"Up");
+
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(hMenu, MF_STRING, CMD_TOGGLE_SEARCHBAND, sSearch.c_str());
+        AppendMenuW(hMenu, MF_STRING, CMD_TOGGLE_BREADCRUMB, sBread.c_str());
+        AppendMenuW(hMenu, MF_STRING, CMD_TOGGLE_UPBUTTON,   sUp.c_str());
+    }
+    SetMenuItemChecked(hMenu, CMD_TOGGLE_SEARCHBAND, g_settings.moveSearchBand);
+    SetMenuItemChecked(hMenu, CMD_TOGGLE_BREADCRUMB, g_settings.moveBreadcrumb);
+    SetMenuItemChecked(hMenu, CMD_TOGGLE_UPBUTTON,   g_settings.moveUpButton);
+}
+
+HWND FindMovedBandChild(HWND rebar, int flagBit) {
+    if (!rebar || !IsWindow(rebar)) return NULL;
+    int cnt = (int)SendMessage(rebar, RB_GETBANDCOUNT, 0, 0);
+    for (int i = 0; i < cnt; i++) {
+        REBARBANDINFO rbi = {sizeof(rbi)};
+        rbi.fMask = RBBIM_CHILD;
+        if (!SendMessage(rebar, RB_GETBANDINFO, i, (LPARAM)&rbi)) continue;
+        if (rbi.hwndChild && HasChildFlag(rbi.hwndChild, flagBit)) return rbi.hwndChild;
+    }
+    return NULL;
+}
+
+int FindBandIndexForChild(HWND rebar, HWND child) {
+    int cnt = (int)SendMessage(rebar, RB_GETBANDCOUNT, 0, 0);
+    for (int i = 0; i < cnt; i++) {
+        REBARBANDINFO rbi = {sizeof(rbi)};
+        rbi.fMask = RBBIM_CHILD;
+        if (!SendMessage(rebar, RB_GETBANDINFO, i, (LPARAM)&rbi)) continue;
+        if (rbi.hwndChild == child) return i;
+    }
+    return -1;
+}
+
+void RemoveMovedBand(HWND cab, BandType type) {
+    int flagBit = (type == BandType::Search) ? CF_SEARCH :
+                  (type == BandType::Breadcrumb) ? CF_BREADCRUMB : CF_UPBUTTON;
+    auto& store = (type == BandType::Search) ? g_removedSearchBand :
+                  (type == BandType::Breadcrumb) ? g_removedBreadcrumbBand : g_removedUpButtonBand;
+
+    HWND menuRebar = GetCabinetMenuRebar(cab);
+    if (!menuRebar || !IsWindow(menuRebar)) return;
+
+    HWND child = FindMovedBandChild(menuRebar, flagBit);
+    if (!child) return;
+
+    // Persist the current order/size of every band (including this one)
+    // before it disappears from the rebar, so it can be restored later
+    // exactly where (and how wide) it was.
+    SaveBandPositions(menuRebar);
+
+    int idx = FindBandIndexForChild(menuRebar, child);
+    if (idx >= 0) SendMessage(menuRebar, RB_DELETEBAND, idx, 0);
+
+    ShowWindow(child, SW_HIDE);
+    ClearAllChildFlags(child);
+
+    EnterCriticalSection(&g_mutex);
+    store[cab] = child;
+    LeaveCriticalSection(&g_mutex);
+
+    ForceCabinetRelayout(cab);
+}
+
+void EnableBand(HWND cab, BandType type) {
+    int flagBit = (type == BandType::Search) ? CF_SEARCH :
+                  (type == BandType::Breadcrumb) ? CF_BREADCRUMB : CF_UPBUTTON;
+    auto& store = (type == BandType::Search) ? g_removedSearchBand :
+                  (type == BandType::Breadcrumb) ? g_removedBreadcrumbBand : g_removedUpButtonBand;
+
+    HWND menuRebar = GetCabinetMenuRebar(cab);
+    if (!menuRebar || !IsWindow(menuRebar)) return;
+
+    if (FindMovedBandChild(menuRebar, flagBit)) return; // already shown
+
+    HWND child = NULL;
+    int width = 200;
+
+    EnterCriticalSection(&g_mutex);
+    auto it = store.find(cab);
+    if (it != store.end() && IsWindow(it->second)) {
+        child = it->second;
+        store.erase(it);
+    }
+    LeaveCriticalSection(&g_mutex);
+
+    if (!child) {
+        HWND navRebar = FindNavbarRebar(cab);
+        if (!navRebar) return;
+        int cnt = (int)SendMessage(navRebar, RB_GETBANDCOUNT, 0, 0);
+        HWND leftover = NULL;
+        for (int i = 0; i < cnt; i++) {
+            REBARBANDINFO rbi = {sizeof(rbi)};
+            rbi.fMask = RBBIM_CHILD;
+            if (!SendMessage(navRebar, RB_GETBANDINFO, i, (LPARAM)&rbi) || !rbi.hwndChild) continue;
+
+            if (type == BandType::Search && ContainsSearchBand(rbi.hwndChild)) {
+                RECT rc; GetWindowRect(rbi.hwndChild, &rc);
+                int w = rc.right - rc.left; if (w < 50) w = 200;
+                child = rbi.hwndChild; width = w;
+                SendMessage(navRebar, RB_DELETEBAND, i, 0);
+                break;
+            } else if (type == BandType::Breadcrumb && ContainsAddressBand(rbi.hwndChild)) {
+                HWND bc = FindBreadcrumbParent(rbi.hwndChild);
+                if (bc) {
+                    HWND bcToolbar = FindWindowEx(bc, NULL, L"ToolbarWindow32", NULL);
+                    if (bcToolbar) {
+                        RECT rc; GetWindowRect(bcToolbar, &rc);
+                        int w = rc.right - rc.left; if (w < 50) w = 250;
+                        child = bcToolbar; width = w; leftover = bc;
+                        SendMessage(navRebar, RB_DELETEBAND, i, 0);
+                        break;
+                    }
+                }
+            } else if (type == BandType::UpButton) {
+                WCHAR cls[256];
+                if (GetClassName(rbi.hwndChild, cls, ARRAYSIZE(cls)) && !wcscmp(cls, L"UpBand")) {
+                    HWND upButton = FindWindowEx(rbi.hwndChild, NULL, L"ToolbarWindow32", NULL);
+                    if (upButton) {
+                        RECT rc; GetWindowRect(upButton, &rc);
+                        int w = rc.right - rc.left; if (w < 20) w = 30;
+                        child = upButton; width = w; leftover = rbi.hwndChild;
+                        SendMessage(navRebar, RB_DELETEBAND, i, 0);
+                        break;
+                    }
+                }
+            }
+        }
+        if (!child) return;
+        if (leftover && IsWindow(leftover)) {
+            MarkNeutered(leftover);
+            ShowWindow(leftover, SW_HIDE);
+        }
+    }
+
+    if (!IsWindow(child)) return;
+
+    SetParent(child, menuRebar);
+
+    WCHAR cls[256] = L"";
+    if (type == BandType::UpButton) wcsncpy_s(cls, ARRAYSIZE(cls), L"UpButtonToolbar", _TRUNCATE);
+    else if (type == BandType::Breadcrumb) wcsncpy_s(cls, ARRAYSIZE(cls), L"BreadcrumbToolbar", _TRUNCATE);
+    else GetClassName(child, cls, ARRAYSIZE(cls));
+
+    BandState bs;
+    bool hasSaved = LoadBandState(cls, bs);
+    UINT useCx = hasSaved ? bs.cx : (UINT)width;
+
+    if (type == BandType::UpButton) {
+        ResizeUpButtonToolbar(child);
+        if (!hasSaved) {
+            SIZE idealSz{};
+            if (SendMessage(child, TB_GETIDEALSIZE, FALSE, (LPARAM)&idealSz) && idealSz.cx > 0) {
+                useCx = (UINT)idealSz.cx;
+            }
+        }
+    } else if (type == BandType::Breadcrumb) {
+        SendMessage(child, TB_AUTOSIZE, 0, 0);
+    }
+
+    int bandHeight = GetDesiredBandHeight();
+    DWORD gripperStyle = GetReferenceGripperStyle(menuRebar);
+
+    REBARBANDINFO rbi = {sizeof(rbi)};
+    rbi.fMask = RBBIM_STYLE | RBBIM_CHILD | RBBIM_CHILDSIZE | RBBIM_SIZE | RBBIM_IDEALSIZE;
+    rbi.fStyle = gripperStyle;
+    if (hasSaved && bs.brk) rbi.fStyle |= RBBS_BREAK;
+    rbi.hwndChild = child;
+    rbi.cyMinChild = bandHeight;
+    rbi.cyMaxChild = bandHeight;
+    rbi.cyChild = bandHeight;
+    rbi.cx = useCx;
+    rbi.cxIdeal = useCx;
+    rbi.cyIntegral = 1;
+
+    BOOL ins = (BOOL)SendMessage(menuRebar, RB_INSERTBAND, (WPARAM)-1, (LPARAM)&rbi);
+    if (ins) {
+        int flags = CF_MOVED | flagBit;
+        SetChildFlag(child, flags);
+        if (type == BandType::UpButton) {
+            HookWindow(child, UpButton_SubclassProc);
+            ResizeUpButtonToolbar(child);
+        } else if (type == BandType::Breadcrumb) {
+            HookWindow(child, BreadcrumbToolbar_SubclassProc);
+        }
+        ShowWindow(child, SW_SHOW);
+
+        // The band was appended at the end; put it back where it used
+        // to be (based on the saved per-class order rank) instead of
+        // leaving it stuck at the last position. This also reapplies
+        // the correct visual size for Up/Breadcrumb bands.
+        ApplySavedLayout(menuRebar);
+        SyncMovedBandGrippers(menuRebar);
+    } else {
+        ShowWindow(child, SW_HIDE);
+        EnterCriticalSection(&g_mutex);
+        store[cab] = child;
+        LeaveCriticalSection(&g_mutex);
+    }
+
+    ForceCabinetRelayout(cab);
+}
+
+void ApplyToolbarVisibilityForAllCabinets(BandType type, bool enable) {
+    DWORD curPid = GetCurrentProcessId();
+    for (HWND w = GetTopWindow(NULL); w; w = GetNextWindow(w, GW_HWNDNEXT)) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (pid != curPid) continue;
+        WCHAR cls[64];
+        if (!GetClassName(w, cls, ARRAYSIZE(cls)) || wcscmp(cls, L"CabinetWClass")) continue;
+        if (!WasAlreadyMoved(w)) continue;
+
+        if (enable) EnableBand(w, type);
+        else RemoveMovedBand(w, type);
+    }
+}
+
+bool HandleToolbarMenuCommand(UINT cmd) {
+    BandType type;
+    bool* setting;
+    const wchar_t* storageName;
+
+    switch (cmd) {
+        case CMD_TOGGLE_SEARCHBAND:
+            type = BandType::Search;
+            setting = &g_settings.moveSearchBand;
+            storageName = L"MoveSearchBand";
+            break;
+        case CMD_TOGGLE_BREADCRUMB:
+            type = BandType::Breadcrumb;
+            setting = &g_settings.moveBreadcrumb;
+            storageName = L"MoveBreadcrumb";
+            break;
+        case CMD_TOGGLE_UPBUTTON:
+            type = BandType::UpButton;
+            setting = &g_settings.moveUpButton;
+            storageName = L"MoveUpButton";
+            break;
+        default:
+            return false;
+    }
+
+    *setting = !(*setting);
+    SaveSettingValue(storageName, *setting);
+    ApplyToolbarVisibilityForAllCabinets(type, *setting);
+    return true;
+}
+
+// ---------------------------------------------------------------------
 
 LRESULT CALLBACK AddressBandRoot_SubclassProc(HWND hwnd,UINT msg,WPARAM wP,LPARAM lP,DWORD_PTR){
     if(IsNeutered(hwnd))return DefWindowProc(hwnd,msg,wP,lP);
@@ -888,6 +1365,12 @@ bool DoMoveSearchBandToMenuBar(HWND cabinetWnd){
 
             if(b.isUpButton) {
                 ResizeUpButtonToolbar(b.child);
+                if(!hasSaved){
+                    SIZE idealSz{};
+                    if(SendMessage(b.child, TB_GETIDEALSIZE, FALSE, (LPARAM)&idealSz) && idealSz.cx > 0){
+                        useCx = (UINT)idealSz.cx;
+                    }
+                }
             }else if(b.isBreadcrumb){
                 SendMessage(b.child, TB_AUTOSIZE, 0, 0);
             }
@@ -909,6 +1392,7 @@ bool DoMoveSearchBandToMenuBar(HWND cabinetWnd){
                 int flags=CF_MOVED;
                 if(b.isUpButton)flags|=CF_UPBUTTON;
                 else if(b.isBreadcrumb)flags|=CF_BREADCRUMB;
+                else flags|=CF_SEARCH;
                 SetChildFlag(b.child,flags);
                 if(b.isUpButton){
                     HookWindow(b.child, UpButton_SubclassProc);
@@ -938,14 +1422,14 @@ bool DoMoveSearchBandToMenuBar(HWND cabinetWnd){
     MarkMoved(cabinetWnd);
 
     if(!toMove.empty()){
+        // This also reapplies the correct visual size for the moved
+        // Up/Breadcrumb bands (see ReapplyBandVisualSizes call at the
+        // end of ApplySavedLayout).
         ApplySavedLayout(menuRebar);
         SyncMovedBandGrippers(menuRebar);
     }
 
-    ExpandShellTabToFillCabinet(cabinetWnd);
-    SuppressStrayNavWorkers(cabinetWnd);
-    RedrawWindow(cabinetWnd,NULL,NULL,
-        RDW_INVALIDATE|RDW_ERASE|RDW_UPDATENOW|RDW_ALLCHILDREN|RDW_ERASENOW|RDW_FRAME);
+    ForceCabinetRelayout(cabinetWnd);
     return true;
 }
 
@@ -1004,6 +1488,58 @@ HWND WINAPI CreateWindowExW_Hook(DWORD s,LPCWSTR c,LPCWSTR wn,DWORD st,int X,int
     return hwnd;
 }
 
+// ---------------------------------------------------------------------
+// TrackPopupMenu / TrackPopupMenuEx hooks — inject toolbar toggle items
+// ---------------------------------------------------------------------
+
+using TrackPopupMenu_t = BOOL(WINAPI*)(HMENU, UINT, int, int, int, HWND, CONST RECT*);
+TrackPopupMenu_t TrackPopupMenu_Original;
+
+BOOL WINAPI TrackPopupMenu_Hook(HMENU hMenu, UINT uFlags, int x, int y, int nReserve, HWND hWnd, CONST RECT* prcRect) {
+    if (!MenuContainsId(hMenu, LOCK_TOOLBARS_CMD_ID)) {
+        return TrackPopupMenu_Original(hMenu, uFlags, x, y, nReserve, hWnd, prcRect);
+    }
+
+    AddOrUpdateToolbarMenuItems(hMenu);
+
+    bool wantReturnCmd = (uFlags & TPM_RETURNCMD) != 0;
+    UINT flags = uFlags | TPM_RETURNCMD;
+    UINT cmd = (UINT)TrackPopupMenu_Original(hMenu, flags, x, y, nReserve, hWnd, prcRect);
+
+    if (HandleToolbarMenuCommand(cmd)) {
+        return wantReturnCmd ? 0 : TRUE;
+    }
+    if (!wantReturnCmd) {
+        if (cmd != 0 && hWnd) PostMessage(hWnd, WM_COMMAND, MAKEWPARAM(LOWORD(cmd), 0), 0);
+        return TRUE;
+    }
+    return (BOOL)cmd;
+}
+
+using TrackPopupMenuEx_t = BOOL(WINAPI*)(HMENU, UINT, int, int, HWND, LPTPMPARAMS);
+TrackPopupMenuEx_t TrackPopupMenuEx_Original;
+
+BOOL WINAPI TrackPopupMenuEx_Hook(HMENU hMenu, UINT uFlags, int x, int y, HWND hWnd, LPTPMPARAMS lptpm) {
+    if (!MenuContainsId(hMenu, LOCK_TOOLBARS_CMD_ID)) {
+        return TrackPopupMenuEx_Original(hMenu, uFlags, x, y, hWnd, lptpm);
+    }
+
+    AddOrUpdateToolbarMenuItems(hMenu);
+
+    bool wantReturnCmd = (uFlags & TPM_RETURNCMD) != 0;
+    UINT flags = uFlags | TPM_RETURNCMD;
+    UINT cmd = (UINT)TrackPopupMenuEx_Original(hMenu, flags, x, y, hWnd, lptpm);
+
+    if (HandleToolbarMenuCommand(cmd)) {
+        return wantReturnCmd ? 0 : TRUE;
+    }
+    if (!wantReturnCmd) {
+        if (cmd != 0 && hWnd) PostMessage(hWnd, WM_COMMAND, MAKEWPARAM(LOWORD(cmd), 0), 0);
+        return TRUE;
+    }
+    return (BOOL)cmd;
+}
+
 BOOL Wh_ModInit(){
     Wh_Log(L"FlexibleExplorer init");
     LoadSettings();
@@ -1017,6 +1553,8 @@ BOOL Wh_ModInit(){
         (void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtSetValueKey"),
         (void*)NtSetValueKey_Hook,
         (void**)&NtSetValueKey_Original);
+    Wh_SetFunctionHook((void*)TrackPopupMenu,(void*)TrackPopupMenu_Hook,(void**)&TrackPopupMenu_Original);
+    Wh_SetFunctionHook((void*)TrackPopupMenuEx,(void*)TrackPopupMenuEx_Hook,(void**)&TrackPopupMenuEx_Original);
 
     DWORD curPid = GetCurrentProcessId();
     for(HWND w=GetTopWindow(NULL);w;w=GetNextWindow(w,GW_HWNDNEXT)){
