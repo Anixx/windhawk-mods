@@ -170,12 +170,7 @@ void RefreshBreadcrumb(HWND cab, HWND breadcrumb) {
     BOOL active = (GetForegroundWindow() == cab);
     SendMessage(cab, WM_NCACTIVATE, !active, 0);
     SendMessage(cab, WM_NCACTIVATE, active, 0);
-    RECT rc;
-    if(GetClientRect(breadcrumb, &rc)) {
-        int cw = rc.right - rc.left;
-        int ch_h = rc.bottom - rc.top;
-        SetWindowPos(breadcrumb, NULL, 0, 0, cw, ch_h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    }
+    SetWindowPos(breadcrumb, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
 BOOL CALLBACK EnumSyncCabinets_Proc(HWND w, LPARAM) {
