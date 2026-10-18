@@ -2,7 +2,7 @@
 // @id              disable-inactive-menubar-greying
 // @name            Disable Inactive Menubar Greying
 // @description     Prevents menubar text from being greyed out in inactive folder windows in Classic theme
-// @version         1.3
+// @version         2.0
 // @author          Anixx
 // @github          https://github.com/Anixx
 // @include         explorer.exe
