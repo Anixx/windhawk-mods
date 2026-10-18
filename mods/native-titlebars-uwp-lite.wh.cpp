@@ -15,7 +15,7 @@
 
 Replaces the UWP titlebars with native Win32 titlebars.
 
-![Screenshot](https://i.imgur.com/oeCYWJY.png)
+![Screenshot](https://i.imgur.com/w5OqyJJ.png)
 
 */
 // ==/WindhawkModReadme==
