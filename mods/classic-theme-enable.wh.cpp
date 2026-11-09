@@ -2,7 +2,7 @@
 // @id             classic-theme-enable
 // @name           Classic Theme
 // @description    Disables theming (enables Classic theme)
-// @version        1.2.8
+// @version        1.2.9
 // @author         Anixx
 // @github         https://github.com/Anixx
 // @include        winlogon.exe
@@ -71,7 +71,7 @@ If you want the Windows logo on the Start button, import this registry file:
     [HKEY_CURRENT_USER\Software\OpenShell\StartMenu\Settings]
     "StartButtonIcon"="%SystemRoot%\\System32\\slui.exe, 2"
     ```
-
+Also, set the taskbar property to opaque in the settings.
 8. Enabling the classic theme will make UWP apps to hang on splash screen. Install the [*Classic UWP Fix*](https://windhawk.net/mods/classic-uwp-fix) mod 
 to mitigate this.
 
@@ -81,7 +81,8 @@ to mitigate this.
 10. Some windows will manifest the unwanted transparency. 
 To fix this, install the [*Classic theme transparency fix*](https://windhawk.net/mods/classic-theme-transparency-fix) mod.
 
-11. On Windows 11 22H2 and later it is recommended to install the mod [*ExplorerFrame and menubar fixes fork*](https://windhawk.net/mods/restore-folder-menubar-25h2).
+11. On Windows 11 22H2 and later it is recommended to install the mod [*ExplorerFrame and menubar fixes fork*](https://windhawk.net/mods/restore-folder-menubar-25h2). For this mod to have effect, on Win11 34H2 and higher
+install also [*Classic Explorerframe for 24H2 and later*](https://windhawk.net/mods/classic-explorerframe).
 
 12. To fix the empty context menus in Explorer, install the mods
 [*Disable Immersive Context Menus*](https://windhawk.net/mods/disable-immersive-context-menus),
